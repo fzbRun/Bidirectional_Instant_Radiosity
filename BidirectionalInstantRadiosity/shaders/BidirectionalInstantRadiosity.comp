@@ -1,0 +1,1048 @@
+#version 450
+
+//---------------------------------------constant---------------------------------------
+const float PI = 3.1415926535f;
+const uint VPLNum = 1024;	//VPL数和样本数
+const uint sampleVertexNum = 30;	//功率估计和简单概率密度估计样本数
+const uint preciseSampleVertexNum = 300;	//精密概率密度估计样本
+const uint connectNum = 30;	//一个reverse VPL与connectNum个standard VPL相连
+const uint resampleNum = 128;
+const uint randomXYNum = 128;
+
+//---------------------------------------struct-----------------------------------------
+
+struct Vertex {
+	vec4 pos;
+	vec4 normal;
+};
+
+float lightA = 25.0f;
+float sqrtLightA = 5.0f;
+vec3 lightStrength = vec3(27.0f, 22.0f, 14.0f);
+
+struct AABBBox {
+	float leftX;
+	float rightX;
+	float leftY;
+	float rightY;
+	float leftZ;
+	float rightZ;
+};
+
+struct BvhArrayNode {
+	int leftNodeIndex;
+	int rightNodeIndex;
+	AABBBox AABB;
+	int meshIndex;
+};
+
+struct Material {
+	//bxdfPara.x表示roughness，y表示metallic，z表示refractivity，若z = 1表示不考虑折射
+	vec4 bxdfPara;
+	vec4 kd;
+	vec4 ks;
+	vec4 ke;
+};
+
+struct Mesh {
+	Material material;
+	ivec2 indexInIndicesArray;
+	AABBBox AABB;
+};
+
+struct Ray{
+	vec3 startPos;
+	vec3 direction;
+	vec3 normal;	//这个主要是记录上一个着色点的法线
+	vec3 radiance;
+	float depth;
+};
+
+struct VPL{
+	vec4 pos;	//w为0表示不存在VPL
+	vec4 normal;
+	Material material;
+	vec4 irradiance;	//xyz是对于standard VPL是irradiance，默认是漫反射平面，所以fr直接当做1/PI
+	vec4 power_useTime_pdf;	//xyz是少量样本路径的功率累加，最后使用0.299f * R + 0.587f * G + 0.114f * B存在x，y是使用次数，w是probability
+};
+
+struct SampleVertex{
+	vec4 pos;	//w表示是否可以打中场景
+	vec4 normal;
+	Material material;
+};
+
+//---------------------------------------input-----------------------------------------
+
+layout(set = 0, binding = 0) uniform LightUniformBufferObject {
+	mat4 model;
+	mat4 view;
+	mat4 proj;
+	vec4 lightPos;
+	vec4 normal;
+	vec4 size;
+} lubo;
+
+layout(set = 1, binding = 0) uniform cameraUniformBufferObject {
+	mat4 model;
+	mat4 view;
+	mat4 proj;
+	vec4 cameraPos;
+	vec4 randomNumber;	//xyz是随机数，而w是帧数
+	vec4 randomXY[randomXYNum];
+} cubo;
+
+layout(set = 2, binding = 0, std430) readonly buffer BvhArray{
+	BvhArrayNode bvhArrayNode[];
+};
+layout(set = 2, binding = 1, std430) readonly buffer Vertices{
+	Vertex vertices[]; 
+};
+layout(set = 2, binding = 2, std430) readonly buffer Indices{
+	uint indices[]; 
+};
+layout(set = 2, binding = 3, std430) readonly buffer Meshs{
+	Mesh meshs[]; 
+};
+
+layout(set = 2, binding = 4) uniform sampler2D shadowMap;
+layout(set = 2, binding = 5, rgba8) uniform writeonly image2D pathTracingResult;
+layout(set = 2, binding = 6, std430) buffer VPLs{
+	VPL vpls[]; 
+};
+layout(set = 2, binding = 7, std430) buffer SampleVertics{
+	SampleVertex sampleVertices[]; 
+};
+layout(set = 2, binding = 8, std430) buffer ResampleVPLs{
+	VPL resampleVPLs[]; 
+};
+
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+//---------------------------------------base function-----------------------------------------
+
+uint pcg(inout uint state)
+{
+    uint prev = state * 747796405u + 2891336453u;
+    uint word = ((prev >> ((prev >> 28u) + 4u)) ^ prev) * 277803737u;
+    state = prev;
+    return (word >> 22u) ^ word;
+}
+
+uvec2 pcg2d(uvec2 v)
+{
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * 1664525u;
+    v.y += v.x * 1664525u;
+    v = v ^ (v >> 16u);
+    v.x += v.y * 1664525u;
+    v.y += v.x * 1664525u;
+    v = v ^ (v >> 16u);
+    return v;
+}
+
+float rand(inout uint seed)
+{
+    uint val = pcg(seed);
+    return (float(val) * (1.0 / float(0xffffffffu)));
+}
+
+mat3 createTBN(vec3 normal){
+
+	vec3 tangent;
+    if(abs(normal.x) > abs(normal.y))
+        tangent = vec3(normal.z, 0, -normal.x);
+    else
+        tangent = vec3(0, -normal.z, normal.y);
+	tangent = normalize(tangent);
+    vec3 bitangent = normalize(cross(normal, tangent));
+	return mat3(tangent, bitangent, normal);
+
+}
+
+void getHitPointNormalAndTBN(uint vertexIndex, inout vec3 normal, inout mat3 TBN){
+
+	//计算面法线
+	vec3 P0 = vertices[vertexIndex].pos.xyz;
+	vec3 P1 = vertices[vertexIndex + 1].pos.xyz;
+	vec3 P2 = vertices[vertexIndex + 2].pos.xyz;
+	
+	vec3 tangent = normalize(P1 - P0);
+	vec3 bitangent = normalize(P2 - P0);
+	normal = normalize(cross(tangent, bitangent));
+	bitangent = normalize(cross(normal, tangent));
+	TBN = mat3(tangent, bitangent, normal);
+	
+}
+
+//-----------------------------------hitTest-----------------------------------------------
+
+//AABB碰撞检测，-1表示没有碰撞到，0表示碰撞到了且不是在场景内部，1表示在场景内部
+bool hitAABB(AABBBox AABB, Ray ray){
+	
+	//判断光线是不是在场景内部发出的，如果是还不能直接抛弃别的场景
+	//虽然会导致每次都与自身发射点的AABB再检测一次hitMesh
+	if(ray.startPos.x > AABB.leftX && ray.startPos.x < AABB.rightX && 
+	   ray.startPos.y > AABB.leftY && ray.startPos.y < AABB.rightY &&
+	   ray.startPos.z > AABB.leftZ && ray.startPos.z < AABB.rightZ){
+		return true;
+	}
+
+	float maxInTime = 0.0f;
+	float minOutTime = 1000000.0f;	//超了再说
+
+	if(ray.direction.x != 0){	//直射与面都不考虑
+		float leftX = (AABB.leftX - ray.startPos.x) / ray.direction.x;
+		float rightX= (AABB.rightX - ray.startPos.x) / ray.direction.x;
+		maxInTime = max(min(leftX, rightX), maxInTime);
+		minOutTime = min(max(leftX, rightX), minOutTime);
+	}
+
+	if(ray.direction.y != 0){
+		float leftY = (AABB.leftY - ray.startPos.y) / ray.direction.y;
+		float rightY = (AABB.rightY - ray.startPos.y) / ray.direction.y;
+		maxInTime = max(min(leftY, rightY), maxInTime);
+		minOutTime = min(max(leftY, rightY), minOutTime);
+	}
+
+	if(ray.direction.z != 0){
+		float leftZ = (AABB.leftZ - ray.startPos.z) / ray.direction.z;
+		float rightZ = (AABB.rightZ - ray.startPos.z) / ray.direction.z;
+		maxInTime = max(min(leftZ, rightZ), maxInTime);
+		minOutTime = min(max(leftZ, rightZ), minOutTime);
+	}
+
+	if(minOutTime < maxInTime){
+		return false;
+	}
+
+	//直接用包围盒中点算可能会导致前面的mesh的AABB的depth反而比后面的大，导致被剔除
+	if(maxInTime > ray.depth){
+		return false;	//深度测试不通过
+	}
+
+	return true;
+	
+
+}
+
+//返回碰撞点的mesh索引、三角形面片的第一个indicis索引，没碰撞到则不动
+void hitMesh(inout Ray ray, uint meshIndex, inout ivec2 result){
+
+	Mesh mesh = meshs[meshIndex];
+
+	uint startVertexIndex = mesh.indexInIndicesArray.x;
+	uint endVertexIndex = mesh.indexInIndicesArray.y;
+	 
+	for(uint i = startVertexIndex; i < endVertexIndex; i += 3){
+		vec3 P0 = vertices[indices[i]].pos.xyz;
+		vec3 P1 = vertices[indices[i + 1]].pos.xyz;
+		vec3 P2 = vertices[indices[i + 2]].pos.xyz;
+
+		vec3 tangent = normalize(P1 - P0);
+		vec3 bitangent = normalize(P2 - P0);
+		vec3 normal = normalize(cross(tangent, bitangent));
+		if(dot(normal, -ray.direction) <= 0){
+			continue;
+		}
+
+		vec3 E1 = P1 - P0;
+		vec3 E2 = P2 - P0;
+		vec3 S = ray.startPos - P0;
+		vec3 S1 = cross(ray.direction, E2);
+		vec3 S2 = cross(S, E1);
+
+		vec3 tbb = 1 / dot(S1, E1) * vec3(dot(S2, E2), dot(S1, S), dot(S2, ray.direction));
+		if(tbb.x > 0 && (1.0f - tbb.y - tbb.z) > 0 && tbb.y > 0 && tbb.z > 0){	//打到了
+			if(tbb.x > ray.depth){
+				continue;	//深度测试没通过
+			}
+			result = ivec2(meshIndex, indices[i]);
+			ray.depth = tbb.x;
+			return;
+		}
+	}
+
+}
+
+//由于不能使用递归，我们需要采用栈的方式循环读取
+ivec2 hitScene(inout Ray ray){
+	
+	ivec2 result = ivec2(-1, -1);
+	//栈的大小需要和和bvh树节点总数相同（最坏情况），应该从CPU中uniform过来的，但是懒得写了，直接用个大小为10的数组，对于我们这个小场景应该够用了
+	//第一个表示sceneIndex，第二个是自身是哪个子树，第三个是父结点是否要去除
+	ivec3 sceneStack[15] = ivec3[15](ivec3(0, 1, 1), ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1),
+									 ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1), ivec3(-1));
+	int stackTop = 0;
+	while(stackTop >= 0){
+
+		if(sceneStack[stackTop].z == -1){	
+			int isRight = sceneStack[stackTop].y;
+			sceneStack[stackTop] = ivec3(-1, -1, -1);
+			stackTop -= 1;
+			if(isRight == 1){
+				sceneStack[stackTop].z = -1;
+			}
+			continue;
+		}
+
+		BvhArrayNode scene = bvhArrayNode[sceneStack[stackTop].x];
+		if(!hitAABB(scene.AABB, ray)){
+			int isRight = sceneStack[stackTop].y;
+			sceneStack[stackTop] = ivec3(-1, -1, -1);
+			stackTop -= 1;
+			if(isRight == 1){
+				sceneStack[stackTop].z = -1;
+			}
+			continue;
+		}
+
+		//若是叶子节点，则直接进行mesh碰撞
+		if(scene.leftNodeIndex == -1){
+			hitMesh(ray, scene.meshIndex, result);
+			int isRight = sceneStack[stackTop].y;
+			sceneStack[stackTop] = ivec3(-1, -1, -1);
+			stackTop -= 1;
+			if(isRight == 1){
+				sceneStack[stackTop].z = -1;
+			}
+			continue;
+		}
+
+		//先将左右子树压栈，先遍历左子树再右子树
+		stackTop += 1;
+		sceneStack[stackTop] = ivec3(scene.rightNodeIndex, 1, 1);
+		stackTop += 1;
+		sceneStack[stackTop] = ivec3(scene.leftNodeIndex, 0, 1);
+
+	}
+
+	return result;
+
+}
+
+//-------------------------------------------test function-------------------------------------------
+void hitTest(vec3 hitPos, vec3 normal){
+
+	Ray ray;
+	ray.startPos = cubo.cameraPos.xyz;
+	ray.direction = normalize(hitPos - cubo.cameraPos.xyz);
+	ray.depth = 100.0f;
+	ray.normal = ray.direction;
+	ivec2 result = hitScene(ray);
+	if(result.x == -1 || abs(ray.depth - length(hitPos - cubo.cameraPos.xyz)) > 0.1f){
+		return;
+	}
+
+	vec4 clipPos = cubo.proj * cubo.view * vec4(hitPos, 1.0f);
+	vec4 ndcPos = clipPos / clipPos.w;
+	ivec2 texelUV = ivec2((ndcPos.xy * 0.5f + 0.5f) * (gl_WorkGroupSize * gl_NumWorkGroups).xy);
+	imageStore(pathTracingResult, texelUV, vec4(10.0f));
+}
+
+//------------------------------------------createRay-------------------------------------------------
+
+//创造起始光线
+Ray makeStartRayFromCamera(vec2 texelUV){
+
+	vec4 ndcPos = vec4(texelUV * 2.0f - 1.0f, 0.0f, 1.0f);
+	vec4 worldPos = inverse(cubo.proj * cubo.view) * ndcPos;
+	Ray ray;
+	ray.startPos = cubo.cameraPos.xyz;
+	ray.direction = normalize((worldPos.xyz / worldPos.w) - ray.startPos);	//得到的worldPos是近平面的一点
+	ray.normal = ray.direction;//normalize(transpose(mat3(cubo.view)) * vec3(0.0f, 0.0f, -1.0f));	//逆矩阵的转置的逆 = 转置 
+	ray.depth = 100.0f;	//远平面
+
+	return ray;
+
+}
+
+//创造起始光子
+Ray makeStartPhoton(inout uint randomNumberSeed, vec2 randomXY, inout float pdf){
+
+	Ray ray;
+	//vec2 randomNumber = Hammersley(uint(rand(randomNumberSeed) * 100), 100) * 0.5f + rand(randomNumberSeed) * 0.5f;
+	//ray.startPos = lubo.lightPos.xyz + lubo.size.xyz * vec3(randomNumber.x, rand(randomNumberSeed), randomNumber.y);
+	ray.startPos = lubo.lightPos.xyz + lubo.size.xyz * vec3(rand(randomNumberSeed), rand(randomNumberSeed), rand(randomNumberSeed));
+	ray.normal = lubo.normal.xyz;
+
+	//cos加权
+	randomNumberSeed++;
+	vec2 randomNumberH = randomXY;	//vec2(rand(randomNumberSeed), rand(randomNumberSeed));
+	float phi = 2.0 * PI * randomNumberH.x;
+	float cosTheta = sqrt(1.0 - randomNumberH.y);	// 1减后还是均匀分布，开平方后还是均匀分布，所以可以直接用
+	float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+	ray.direction = normalize(vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta));
+
+	ray.direction = normalize(createTBN(ray.normal) * ray.direction);
+	ray.depth = 100.0f;
+	ray.radiance = lightStrength / lightA;
+
+	pdf = cosTheta / PI;
+
+	return ray;
+
+}
+
+//------------------------------------------bxdf function-------------------------------------------------
+
+//需要材质、TBN
+vec3 getRayFromBxdf(Material material, mat3 TBN, vec3 i, vec3 normal, inout uint randomNumberSeed, inout float pdf){
+
+	vec2 randomNumberH = vec2(rand(randomNumberSeed), rand(randomNumberSeed));
+
+	float roughness =  max(material.bxdfPara.x, 0.1f);	//若粗糙度为0，D将是0/0，且趋近于无穷，除非分子上是a4，但是又会导致不是趋近于0时的值的错误
+	float a2 = roughness * roughness * roughness * roughness;
+	float phi = 2.0 * PI * randomNumberH.x;
+	//若roughness是1，则cosTheta是sqrt(1-randomNumberH.y)，所以完全粗糙的情况下，就是cos加权，且pdf也就是cosTheta / PI
+	float cosTheta = sqrt((1.0 - randomNumberH.y) / (1.0 + (a2 - 1.0) * randomNumberH.y));
+	float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+
+	vec3 h = normalize(vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta));
+
+	float d = (a2 - 1) * cosTheta * cosTheta + 1;
+	float D = a2 / (PI * d * d);
+	pdf = D * cosTheta;	//h的pdf
+
+	vec3 rayDirection = normalize(createTBN(reflect(-i, normal)) * h);
+	int k = 0;
+	while(dot(rayDirection, normal) <= 0.0f && k < 5){
+		rayDirection = normalize(rayDirection + reflect(-i, normal));
+		k++;
+	}
+	if(k == 5){
+		rayDirection = reflect(-i, normal);
+	}
+
+	pdf = clamp(pdf, 0.01f, 1.0f);
+	return rayDirection;
+
+}
+
+float DistributionGGX(vec3 N, vec3 H, float roughness)
+{
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float NdotH = max(dot(N, H), 0.0);
+    float NdotH2 = NdotH * NdotH;
+
+    float nom   = a2;
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    denom = PI * denom * denom;
+
+    return nom / denom;
+}
+
+float GeometrySchlickGGX(float NdotV, float roughness)
+{
+    float r = (roughness + 1.0);
+    float k = (r * r) / 8.0;
+
+    float nom   = NdotV;
+    float denom = NdotV * (1.0 - k) + k;
+
+    return nom / denom;
+}
+
+float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness)
+{
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotL = max(dot(N, L), 0.0);
+    float ggx2 = GeometrySchlickGGX(NdotV, roughness);
+    float ggx1 = GeometrySchlickGGX(NdotL, roughness);
+
+    return ggx1 * ggx2;
+}
+
+vec3 fresnelSchlick(float cosTheta, vec3 F0)
+{
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+//若当前hitPoint是i，那么currentPos是i-1，startPos是i-2，也就是说只有当i >= 2时才计算weight
+vec3 getFr(vec3 startPos, vec3 currentPos, vec3 currentNormal, vec3 hitPos, Material material){
+
+	vec3 albedo = material.kd.rgb;
+	float roughness = clamp(material.bxdfPara.x, 0.1f, 1.0f);
+	float metallic = material.bxdfPara.y;
+	float refractivity = material.bxdfPara.z;
+
+	float diff_fr = 1 / (2 * PI);
+
+	vec3 F0 = vec3(0.04); 
+	F0 = mix(F0, albedo, metallic);
+
+	vec3 i = normalize(hitPos - currentPos);
+	vec3 o = normalize(startPos - currentPos);
+	vec3 h = normalize(i + o);
+	float NDF = DistributionGGX(currentNormal, h, roughness);        
+	float G = GeometrySmith(currentNormal, o, i, roughness);      
+	vec3 F = fresnelSchlick(max(dot(h, o), 0.0), F0); 
+
+	vec3 nominator = NDF * G * F;
+	float denominator = 4.0 * max(dot(currentNormal, o), 0.0) * max(dot(currentNormal, i), 0.0) + 0.001; 
+	vec3 spec_fr = nominator / denominator;
+
+	vec3 ks = F;
+	vec3 kd = vec3(1.0) - ks;
+	kd *= (1.0 - metallic) * material.bxdfPara.x;
+
+	return kd * albedo * diff_fr + spec_fr;
+
+}
+
+//---------------------------------------------getRadiance--------------------------------------------
+
+float getShadow(vec3 worldPos, vec3 lightPos){
+
+	vec4 clipPos = lubo.proj * lubo.view * lubo.model * vec4(worldPos, 1.0f);
+	vec3 ndcPos = clipPos.xyz / clipPos.w;
+	vec2 uv = (ndcPos.xy * 0.5f + 0.5f);
+
+	float depth = texture(shadowMap, uv).x;
+	if(ndcPos.z + 0.001f < depth){
+		return 1.0f;
+	}
+	return 0.0f;
+
+	/*
+	Ray ray;
+	ray.startPos = worldPos;
+	ray.direction = normalize(lightPos - worldPos);
+	ray.depth = 100.0f;
+	
+	hitScene(ray);
+	return abs(ray.depth - length(lightPos - worldPos)) < 0.05f ? 1.0f : 0.0f;
+	*/
+
+}
+
+vec3 getRadianceFromLight(vec3 startPos, vec3 hitPos, vec3 normal, Material material){
+
+	//return vec3(0.0f);
+
+	vec3 radiance = vec3(0.0f);
+
+	vec3 lightPos = lubo.lightPos.xyz;
+	vec3 lightNormal = normalize(lubo.normal.xyz);
+	vec4 lightSize = lubo.size;
+
+	float pdf = 1 / float(lightA);
+	vec3 o = normalize(startPos - hitPos);
+	vec3 Li = lightStrength / float(lightA);
+	float diff_fr = 1 / PI;	//(2 * PI);
+
+	vec3 albedo = material.kd.rgb;
+	float roughness = clamp(material.bxdfPara.x, 0.1f, 1.0f);
+	float metallic = material.bxdfPara.y;
+	float refractivity = material.bxdfPara.z;
+
+	vec3 F0 = vec3(0.04); 
+	F0 = mix(F0, albedo, metallic);
+
+	//将面光源分为kxk的小点光源
+	for(int i = 1; i < sqrtLightA * 2; i += 2){
+		vec3 lightPointPos = lightPos + vec3(lightSize.x, 0.0f, 0.0f) * i / (sqrtLightA * 2);
+		for(int j = 1; j < sqrtLightA * 2; j += 2){
+
+			lightPointPos = lightPos + vec3(0.0f, 0.0f, lightSize.z) * j / (sqrtLightA * 2);
+			
+			vec3 i = normalize(lightPointPos - hitPos);
+			vec2 cosTheta = vec2(max(dot(-i, lightNormal), 0.0f), max(dot(i, normal), 0.0f));
+			float distance = max(length(lightPointPos - hitPos), 1.0f);
+
+			float other = cosTheta.x * cosTheta.y / (distance * distance);
+
+			vec3 h = normalize(i + o);
+			float NDF = DistributionGGX(normal, h, roughness);        
+			float G = GeometrySmith(normal, o, i, roughness);      
+			vec3 F = fresnelSchlick(max(dot(h, o), 0.0), F0); 
+
+			vec3 nominator = NDF * G * F;
+			float denominator = 4.0 * max(dot(normal, o), 0.0) * max(dot(normal, i), 0.0) + 0.001; 
+			vec3 spec_fr = nominator / denominator;
+
+			vec3 ks = F;
+			vec3 kd = vec3(1.0) - ks;
+			kd *= (1.0 - metallic) * material.bxdfPara.x;  
+
+			radiance += (kd * albedo * diff_fr + spec_fr) * Li * other / pdf * getShadow(hitPos, lightPointPos);
+
+		}
+	}
+
+	return radiance / float(lightA);
+
+}
+
+//计算撞击点的自发光
+vec3 getRadianceFromHitPoint(Material material, vec3 startPos, vec3 hitPos, vec3 hitNormal) {
+	
+	if(material.ke.rgb != vec3(0.0f)){
+		float cosTheta = dot(normalize(hitPos - startPos), hitNormal);
+		return material.ke.rgb / float(lightA) *  abs(cosTheta);	//场景就一个光源有自发光，所以写死
+	}
+	return vec3(0.0f);
+}
+
+//---------------------------------------------createVPL---------------------------------------------
+void makeStandardVPL(inout uint randomNumberSeed, vec2 randomXY, uint standardVPLIndex){
+
+	VPL vpl;
+	vpl.pos = vec4(0.0f);
+	vpl.normal = vec4(0.0f);
+	vpl.irradiance = vec4(0.0f);
+	vpl.power_useTime_pdf = vec4(0.0f);
+
+	vec3 radiance = vec3(0.0f);
+	vec3 normal;
+	mat3 TBN = mat3(1.0f);
+	vec3 hitPos = vec3(1.0f);
+	Material material;
+	float pdf = 1.0f;
+
+	Ray ray = makeStartPhoton(randomNumberSeed, randomXY, pdf);
+	ivec2 result = hitScene(ray);
+	int lossNum = 0;
+	while(lossNum < 10 && result.x == -1){
+		randomNumberSeed++;
+		ray = makeStartPhoton(randomNumberSeed, vec2(rand(randomNumberSeed), rand(randomNumberSeed)), pdf);
+		lossNum++;
+		result = hitScene(ray);
+	}
+	if(lossNum == 10){
+		vpls[standardVPLIndex] = vpl;
+		return;
+	}
+
+	int meshIndex = result.x;
+	int vertexIndex = result.y;
+	hitPos = ray.startPos + ray.depth * ray.direction;
+	getHitPointNormalAndTBN(vertexIndex, normal, TBN);	//计算面法线
+	material = meshs[meshIndex].material;
+
+	//hitTest(hitPos, normal);
+
+	vpl.pos = vec4(hitPos, 1.0f);
+	vpl.normal = vec4(normal, 0.0f);
+	vpl.material = material;
+	float distance = length(hitPos - ray.startPos);
+	vec3 irradiance = lightStrength / lightA * max(dot(lubo.normal.xyz, ray.direction), 0.0f) * max(dot(normal, -ray.direction), 0.0f) / distance / distance / pdf;
+	vpl.irradiance.xyz = irradiance;
+	vpl.power_useTime_pdf = vec4(0.0f);
+	vpls[standardVPLIndex] = vpl;
+	return;
+
+}
+
+//在生成reverseVPL的过程中，可以顺联将需要使用的样本点生成，即相机发出射线击中的第一个顶点
+void makeReverseVPL(vec2 randomXY, inout uint randomNumberSeed, uint reverseVPLIndex){
+
+	SampleVertex sampleVertex;
+	sampleVertex.pos = vec4(0.0f);
+	
+	VPL vpl;
+	vpl.pos = vec4(0.0f);
+	vpl.normal = vec4(0.0f);
+	vpl.irradiance = vec4(0.0f);
+	vpl.power_useTime_pdf = vec4(0.0f);
+
+	vec3 radiance = vec3(0.0f);
+	vec3 normal;
+	mat3 TBN = mat3(1.0f);
+	vec3 hitPos = vec3(1.0f);
+	Material material;
+	float pdf = 1.0f;
+
+	//根据传进来的theta和phi，均匀的发出样本点
+	Ray ray = makeStartRayFromCamera(randomXY);
+	ivec2 result = hitScene(ray);
+	int lossNum = 0;
+	while(lossNum < 10 && result.x == -1){
+		randomNumberSeed++;
+		ray = makeStartRayFromCamera(vec2(rand(randomNumberSeed), rand(randomNumberSeed)));
+		lossNum++;
+		result = hitScene(ray);
+	}
+	if(lossNum == 10){
+		sampleVertices[reverseVPLIndex] = sampleVertex;
+		return;
+	}
+
+	int meshIndex = result.x;
+	int vertexIndex = result.y;
+	hitPos = ray.startPos + ray.depth * ray.direction;
+	getHitPointNormalAndTBN(vertexIndex, normal, TBN);	//计算面法线
+	material = meshs[meshIndex].material;
+
+	//hitTest(hitPos, normal);
+
+	sampleVertex.pos = vec4(hitPos, 1.0f);
+	sampleVertex.normal.xyz = normal;
+	sampleVertex.material = material;
+	sampleVertices[reverseVPLIndex] = sampleVertex;
+
+	ray.direction = getRayFromBxdf(material, TBN, -ray.direction, normal, randomNumberSeed, pdf);
+	ray.startPos = hitPos;
+	ray.normal = normal;
+	ray.depth = 100.0f;
+
+	result = hitScene(ray);
+	lossNum = 0;
+	while(lossNum < 10 && result.x == -1){
+		randomNumberSeed++;
+		ray.direction = getRayFromBxdf(material, TBN, -ray.direction, normal, randomNumberSeed, pdf);
+		ray.depth = 100.0f;
+		lossNum++;
+		result = hitScene(ray);
+	}
+	if(lossNum == 10){
+		vpls[reverseVPLIndex] = vpl;
+		return;
+	}
+
+	meshIndex = result.x;
+	vertexIndex = result.y;
+	hitPos = ray.startPos + ray.depth * ray.direction;
+	getHitPointNormalAndTBN(vertexIndex, normal, TBN);		//计算面法线
+	material = meshs[meshIndex].material;
+
+	vpl.pos = vec4(hitPos, 1.0f);
+	vpl.normal = vec4(normal, 0.0f);
+	vpl.material = material;
+	vpl.irradiance = vec4(0.0f);
+	vpl.power_useTime_pdf = vec4(0.0f);
+	vpls[reverseVPLIndex] = vpl;
+
+	return;
+
+}
+
+//---------------------------------------------estimate---------------------------------------------
+void power_pdf_Estimate(uint reverseVPLIndex, uint randomNumberSeed){
+
+	VPL vpl = vpls[reverseVPLIndex];
+	if(vpl.pos.w == 0.0f){	//VPL不存在
+		return;
+	}
+
+	vec4 standardVPLPos[connectNum];
+	vec4 irradianceVPL[connectNum];
+	int connectNum_test = 0;
+	for(int i = 0; i < connectNum; i++){
+
+		standardVPLPos[i] = vec4(0.0f);
+		irradianceVPL[i] = vec4(0.0f);
+
+		uint standardVPLIndex = uint(rand(randomNumberSeed) * VPLNum) + VPLNum;
+		VPL standardVPL = vpls[standardVPLIndex];
+		if(standardVPL.pos.w == 0.0f){
+			continue;
+		}
+		connectNum_test++;
+
+		if(dot(vpl.pos.xyz - standardVPL.pos.xyz, standardVPL.normal.xyz) < 0.0f){
+			continue;
+		}
+
+		Ray ray;
+		ray.startPos = vpl.pos.xyz;
+		ray.direction = normalize(standardVPL.pos.xyz - vpl.pos.xyz);
+		ray.depth = 100.0f;
+		ray.normal = vpl.normal.xyz;
+		ivec2 result = hitScene(ray);
+		if(abs(ray.depth - length(vpl.pos.xyz - standardVPL.pos.xyz)) > 0.01f || result.x == -1){
+			continue;
+		}
+
+		vec3 weight_lTor = getFr(vpl.pos.xyz, standardVPL.pos.xyz, standardVPL.normal.xyz, lubo.lightPos.xyz, standardVPL.material) * max(dot(vpl.normal.xyz, normalize(standardVPL.pos.xyz - vpl.pos.xyz)), 0.0f);
+		irradianceVPL[i].xyz = standardVPL.irradiance.xyz * weight_lTor;		
+		vpl.irradiance.xyz += irradianceVPL[i].xyz;	//只存接受standard VPL传来的irradiance
+		standardVPLPos[i] = standardVPL.pos;
+
+	}
+	if(connectNum_test == 0){
+		vpl.irradiance = vec4(0.0f);
+		vpls[reverseVPLIndex] = vpl;
+		return;
+	}
+	vpl.irradiance.xyz /= connectNum_test;
+
+	vec3 power = vec3(0.0f);
+	float pdf = 1.0f;
+	int sampleVertexNum_test = 0;
+	for(int i = 0; i < sampleVertexNum; i++){
+		
+		//其实不应该随机挑选采样点，而是复用较多无遮挡的样本点，这个之后想办法吧
+		uint sampleVertexIndex = uint(rand(randomNumberSeed) * VPLNum);
+		SampleVertex sampleVertex = sampleVertices[sampleVertexIndex];
+		if(sampleVertex.pos.w == 0.0f){
+			continue;
+		}
+		sampleVertexNum_test++;
+
+		if(dot(sampleVertex.pos.xyz - vpl.pos.xyz, vpl.normal.xyz) < 0.0f){
+			continue;
+		}
+
+		Ray ray;
+		ray.startPos = sampleVertex.pos.xyz;
+		ray.direction = normalize(vpl.pos.xyz - sampleVertex.pos.xyz);
+		ray.depth = 100.0f;
+		ray.normal = vpl.normal.xyz;
+		ivec2 result = hitScene(ray);
+		if(abs(ray.depth - length(vpl.pos.xyz - sampleVertex.pos.xyz)) > 0.1f || result.x == -1){
+			continue;
+		}
+		
+		vec3 powerVPL = vec3(0.0f);
+		for(int j = 0; j < connectNum; j++){
+			if(standardVPLPos[j].w == 0.0f){
+				continue;
+			}
+			vec3 weight_sTos = getFr(sampleVertex.pos.xyz, vpl.pos.xyz, vpl.normal.xyz, standardVPLPos[j].xyz, vpl.material);
+			powerVPL += irradianceVPL[j].xyz * weight_sTos;
+		}
+		vec3 weight_rToc = getFr(cubo.cameraPos.xyz, sampleVertex.pos.xyz, sampleVertex.normal.xyz, vpl.pos.xyz, sampleVertex.material) * max(dot(normalize(vpl.pos.xyz - sampleVertex.pos.xyz), sampleVertex.normal.xyz), 0.0f);
+		power += max((powerVPL * weight_rToc), 0.0f) / connectNum_test;
+
+		vec3 lightRadiance = getRadianceFromLight(sampleVertex.pos.xyz, vpl.pos.xyz, vpl.normal.xyz, vpl.material);
+		power += lightRadiance * weight_rToc;
+
+		vec3 h = normalize(normalize(vpl.pos.xyz - sampleVertex.pos.xyz) + normalize(cubo.cameraPos.xyz - sampleVertex.pos.xyz));
+		float cosTheta = max(dot(sampleVertex.normal.xyz, h), 0.001f);
+		float roughness = sampleVertex.material.bxdfPara.x;
+		float a2 = roughness * roughness;
+		float d = (a2 - 1) * cosTheta * cosTheta + 1;
+		float D = a2 / (PI * d * d);
+		pdf += clamp(D * cosTheta, 0.01f, 1.0f);	//h的pdf
+
+	}
+	if(sampleVertexNum_test == 0){
+		vpl.irradiance = vec4(0.0f);
+		vpls[reverseVPLIndex] = vpl;
+		return;
+	}
+	power /= sampleVertexNum_test;
+	pdf /= sampleVertexNum_test;
+	vpl.power_useTime_pdf = vec4(0.299f * power.x + 0.587f * power.y + 0.114f * power.z, 0.0f, 0.0f, pdf);
+	vpl.irradiance.xyz = vpl.irradiance.xyz / sampleVertexNum_test / PI;		//默认漫反射，所以直接将fr=1/PI加上
+	vpls[reverseVPLIndex] = vpl;
+	return;
+
+}
+
+//通过功率大小，选择出resampleNum个reverseVPL
+//这里其实可以使用多线程快速排序的
+void resampleReverseVPL(){
+
+	float CDF = 0.0f;
+	for(int i = 0; i < VPLNum; i++){
+		if(vpls[i].pos.w != 0 && vpls[i].power_useTime_pdf.w != 0.0f){
+			CDF += vpls[i].power_useTime_pdf.x;
+		}
+	}
+	if(CDF == 0.0f){	//如果CDF = 0，那么必然所有VPL的功率都为0，那么后续的pdf也为0，所以直接return
+		return;
+	}
+	CDF += 0.05f * VPLNum;
+
+	for(int i = 0; i < resampleNum; i++){
+		VPL vpl = vpls[i];
+		uint maxVPLIndex = i;
+		for(int j = i + 1; j < VPLNum; j++){
+			VPL vplTemp = vpls[j];
+			if(vplTemp.pos.w == 0.0f){
+				continue;
+			}
+			if(vplTemp.power_useTime_pdf.x > vpl.power_useTime_pdf.x){
+				vpl =  vplTemp;
+				maxVPLIndex = j;
+			}
+		}
+		vpls[maxVPLIndex] = vpls[i];
+		vpl.power_useTime_pdf.x = (vpl.power_useTime_pdf.x + 0.05f) / CDF;
+		vpls[i] = vpl;
+	}
+
+}
+
+void resampleReverseVPL_preciseEstimate(uint resampleVPLIndex, uint randomNumberSeed){
+	
+	VPL resampleVPL = resampleVPLs[resampleVPLIndex];
+	uint VPLIndex = resampleVPLIndex * (VPLNum / resampleNum);	//默认都是2的指数倍
+	VPL maxVPL;
+	maxVPL.power_useTime_pdf.x = 0.0f;
+	for(uint i = VPLIndex; i < VPLIndex + VPLNum / resampleNum; i++){
+
+		VPL vpl = vpls[i];
+		if(vpl.pos.w == 0.0f || vpl.power_useTime_pdf.w == 0.0f){
+			continue;
+		}
+
+		if(vpl.power_useTime_pdf.x > maxVPL.power_useTime_pdf.x){
+			maxVPL = vpl;
+		}
+
+	}
+	if(maxVPL.power_useTime_pdf.x == 0.0f){
+		return;
+	}
+
+	float pdf = 0.0f;
+	int sampleVertexNum_test = 0;
+	for(int i = 0; i < preciseSampleVertexNum; i++){
+
+		uint sampleIndex = uint(rand(randomNumberSeed) * VPLNum);
+		SampleVertex sampleVertex = sampleVertices[sampleIndex];
+		if(sampleVertex.pos.w == 0.0f){
+			continue;
+		}
+		sampleVertexNum_test++;
+
+		if(dot(sampleVertex.pos.xyz - maxVPL.pos.xyz, maxVPL.normal.xyz) < 0.0f){
+			continue;
+		}
+
+		Ray ray;
+		ray.startPos = sampleVertex.pos.xyz;
+		ray.direction = normalize(maxVPL.pos.xyz - sampleVertex.pos.xyz);
+		ray.depth = 100.0f;
+		ray.normal = maxVPL.normal.xyz;
+		ivec2 result = hitScene(ray);
+		if(abs(ray.depth - length(maxVPL.pos.xyz - sampleVertex.pos.xyz)) > 0.1f || result.x == -1){
+			continue;
+		}
+
+		vec3 h = normalize(normalize(maxVPL.pos.xyz - sampleVertex.pos.xyz) + normalize(cubo.cameraPos.xyz - sampleVertex.pos.xyz));
+		float cosTheta = max(dot(sampleVertex.normal.xyz, h), 0.001f);
+		float roughness = sampleVertex.material.bxdfPara.x;
+		float a2 = roughness * roughness;
+		float d = (a2 - 1) * cosTheta * cosTheta + 1;
+		float D = a2 / (PI * d * d);
+		pdf += clamp(D * cosTheta, 0.01f, 1.0f);	//h的pdf
+
+	}
+	if(sampleVertexNum_test == 0){
+		return;
+	}
+	pdf /= sampleVertexNum_test;
+	maxVPL.power_useTime_pdf.w = pdf * maxVPL.power_useTime_pdf.x;
+	//float resampleVPLPower = resampleVPL.power_useTime_pdf.w * pow(resampleVPL.power_useTime_pdf.y, -0.7f);
+	//if(resampleVPLPower < maxVPL.power_useTime_pdf.w){
+	//	resampleVPL = maxVPL;
+	//	resampleVPL.power_useTime_pdf.y = 2.0f;
+	//}
+	//resampleVPL.power_useTime_pdf.y++;
+	if(rand(randomNumberSeed) < maxVPL.power_useTime_pdf.w / (maxVPL.power_useTime_pdf.w + resampleVPL.power_useTime_pdf.w)){
+		resampleVPL = maxVPL;
+	}
+	resampleVPLs[resampleVPLIndex] = resampleVPL;
+
+}
+
+//---------------------------------------------pathTracing---------------------------------------------
+vec3 pathTracing(Ray ray, uint randomNumberSeed){
+
+	vec3 radiance = vec3(0.0f);
+	vec3 normal;
+	mat3 TBN = mat3(1.0f);
+	vec3 hitPos = vec3(1.0f);
+	Material material;
+
+	ivec2 result = hitScene(ray);
+	if(result.x == -1){
+		return vec3(0.0f);
+	}
+
+	int meshIndex = result.x;
+	int vertexIndex = result.y;
+	hitPos = ray.startPos + ray.depth * ray.direction;
+	getHitPointNormalAndTBN(vertexIndex, normal, TBN);	//计算面法线
+	material = meshs[meshIndex].material;
+
+	vec3 lightRadiance = getRadianceFromLight(ray.startPos, hitPos, normal, material);	//发过来的radiance
+	vec3 hitPointEmission = getRadianceFromHitPoint(material, ray.startPos, hitPos, normal);
+	vec3 irradiance = lightRadiance + hitPointEmission;
+	//radiance += irradiance;		//weight = 1
+
+	vec3 cameraPos = ray.startPos;
+	vec3 indirectRadiance = vec3(0.0f);
+	for(int i = 0; i < resampleNum; i++){
+		VPL vpl = resampleVPLs[i];
+		if(vpl.power_useTime_pdf.w == 0.0f){
+			return radiance;
+		}
+
+		if(dot(hitPos - vpl.pos.xyz, vpl.normal.xyz) < 0.0f){
+			continue;
+		}
+	
+		ray.startPos = hitPos;
+		ray.direction = normalize(vpl.pos.xyz - hitPos);
+		ray.depth = 100.0f;
+		ray.normal = normal;
+		result = hitScene(ray);
+		if(abs(ray.depth - length(vpl.pos.xyz - hitPos)) < 0.01f && result.x != -1){
+			vec3 fr_rToc = getFr(cameraPos, hitPos, normal, vpl.pos.xyz, material);
+			indirectRadiance += vpl.irradiance.xyz * fr_rToc * max(dot(normalize(vpl.pos.xyz - hitPos), normal), 0.0f) / vpl.power_useTime_pdf.w;
+		}
+
+	}
+	radiance += indirectRadiance;
+	return radiance;
+
+}
+
+
+//------------------------------------------------------------------------------------------------------
+void main(){
+
+	uint workGroupSize = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
+	uint workGroupIndex = gl_WorkGroupID.z * gl_NumWorkGroups.x * gl_NumWorkGroups.y + gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+	//不能直接用gl_GlobalInvocationID，因为我要尽量让一个worlGroup进行工作，现在相当于按组排序
+	uint threadIndex = workGroupIndex * workGroupSize + uint(gl_LocalInvocationIndex);
+
+	uvec2 seed2 = pcg2d(ivec2(gl_GlobalInvocationID) * (uint(cubo.randomNumber.w + cubo.randomNumber.x) + 1));
+	uint seed = seed2.x + seed2.y;
+	Ray ray;
+
+	//生成功率估计和概率密度估计的样本点和VPL
+	if(threadIndex < VPLNum){
+		makeReverseVPL(cubo.randomXY[threadIndex].xy, seed, threadIndex);
+		//makeReverseVPL(vec2(rand(seed), rand(seed)), seed, threadIndex);
+	}else if(threadIndex >= VPLNum && threadIndex < 2 * VPLNum){
+		makeStandardVPL(seed, cubo.randomXY[threadIndex % randomXYNum].xy, threadIndex);
+	}
+	memoryBarrierBuffer();
+
+	//功率估计和简单概率密度估计
+	if(threadIndex < VPLNum){
+		power_pdf_Estimate(threadIndex, seed);
+	}
+	memoryBarrierBuffer();
+
+	//if(threadIndex < resampleNum){
+	//	resampleReverseVPL();
+	//}
+	//memoryBarrierBuffer();
+
+	if(threadIndex < resampleNum){
+		resampleReverseVPL_preciseEstimate(threadIndex, seed);
+	}
+	memoryBarrierBuffer();
+
+	vec3 radiance = vec3(0.0f);
+	vec2 texelSize = 1.0f / (gl_WorkGroupSize * gl_NumWorkGroups).xy;
+	int sppNum = 1;
+	for(int i = 0; i < sppNum; i++){
+		vec2 texelUV = (vec2(gl_GlobalInvocationID.xy) + vec2(rand(seed), rand(seed))) * texelSize;
+		ray = makeStartRayFromCamera(texelUV);
+		seed += i;
+		radiance += pathTracing(ray, seed);
+	}
+
+	radiance /= sppNum;
+	imageStore(pathTracingResult, ivec2(gl_GlobalInvocationID.xy), vec4(radiance, 1.0f));
+
+}
